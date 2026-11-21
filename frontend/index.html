@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>双人录音复听分段</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>双人录音复听分段</h1>
+    <p class="sub">上传 ≤30 秒的 16 kHz 单声道 WAV，为甲、乙各标 3～8 段参考语音，自动分段并复听。</p>
+  </header>
+
+  <main>
+    <section class="panel">
+      <h2>1. 载入录音</h2>
+      <div class="row">
+        <input type="file" id="fileInput" accept=".wav,audio/wav,audio/x-wav">
+        <button id="demoBtn" type="button">载入演示音频</button>
+        <span id="fileInfo" class="muted"></span>
+      </div>
+      <audio id="player" controls preload="auto"></audio>
+    </section>
+
+    <section class="panel">
+      <h2>2. 标注参考语音</h2>
+      <p class="hint">在波形上<b>按住拖动</b>选择片段，然后点「设为甲参考」或「设为乙参考」；单击波形可跳转播放。</p>
+      <canvas id="wave" height="160"></canvas>
+      <div class="row">
+        <span id="selInfo" class="muted">未选择片段</span>
+        <button id="playSelBtn" type="button" disabled>试听选区</button>
+        <button id="clearSelBtn" type="button" disabled>清除选区</button>
+        <button id="addABtn" type="button" class="a" disabled>设为甲参考</button>
+        <button id="addBBtn" type="button" class="b" disabled>设为乙参考</button>
+      </div>
+      <div id="refLists">
+        <div>
+          <h3><span class="dot a"></span>甲的参考（<span id="countA">0</span>/3～8）</h3>
+          <ul id="listA" class="refs"></ul>
+        </div>
+        <div>
+          <h3><span class="dot b"></span>乙的参考（<span id="countB">0</span>/3～8）</h3>
+          <ul id="listB" class="refs"></ul>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>3. 分析与复听</h2>
+      <div class="row">
+        <button id="analyzeBtn" type="button" class="primary" disabled>开始分析</button>
+        <span id="status" class="muted"></span>
+      </div>
+      <div id="legend" class="row legend hidden">
+        <span><i class="sw a"></i>甲</span>
+        <span><i class="sw b"></i>乙</span>
+        <span><i class="sw review"></i>待复核</span>
+        <span><i class="sw silence"></i>静音</span>
+        <span class="muted">颜色越不透明置信度越高；点击片段跳转复听</span>
+      </div>
+      <div id="timeline" class="timeline hidden"></div>
+      <div id="segTable" class="hidden"></div>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
