@@ -13,17 +13,18 @@ from .audio import AudioError, load_wav
 from .classify import (
     LABEL_SILENCE,
     classify_frames,
+    estimate_noise,
     merge_segments,
-    vad_mask,
+    refs_to_frame_indices,
 )
 from .demo import demo_payload
-from .features import FRAME_HOP, SAMPLE_RATE, extract_features
+from .features import FRAME_HOP, SAMPLE_RATE, cepstral_features, extract_features
 
 MIN_REFS = 3
 MAX_REFS = 8
 MIN_REF_LEN = 0.3        # 单段参考最短时长（秒）
-MIN_REF_FRAMES = 10      # 每位说话人参考中至少需要的非静音帧数
-MIN_SPEECH_FRAMES = 30   # 整条录音至少需要的非静音帧数
+MIN_REF_FRAMES = 10      # 每位说话人参考中至少需要的有效语音帧数
+MIN_SPEECH_FRAMES = 30   # 整条录音至少需要的有效语音帧数
 
 SPEAKER_NAMES = {"A": "甲", "B": "乙"}
 
@@ -83,15 +84,15 @@ def parse_references(raw: str, duration: float) -> dict:
     return cleaned
 
 
-def refs_to_frame_indices(segments, times: np.ndarray, speech_mask: np.ndarray) -> np.ndarray:
-    """参考时间段 -> 非静音帧下标集合。"""
-    idx = []
-    for s, e in segments:
-        hit = np.where((times >= s) & (times <= e) & speech_mask)[0]
-        idx.append(hit)
-    if not idx:
-        return np.empty(0, dtype=int)
-    return np.unique(np.concatenate(idx)).astype(int)
+def _ref_advice(key: str, frame_count: int, ref_max_evidence: float, low_threshold: float) -> str:
+    name = SPEAKER_NAMES[key]
+    if ref_max_evidence <= low_threshold:
+        return (f"说话人{name}的参考语音不足：所选片段里几乎只有静音或底噪，"
+                f"没有可辨认的发言（有效语音 {frame_count} 帧，至少需 {MIN_REF_FRAMES} 帧）。"
+                f"请改选能听到该说话人清晰发言的片段")
+    return (f"说话人{name}的参考语音不足：参考段里的说话声太轻，与底噪难以区分"
+            f"（有效语音仅 {frame_count} 帧，至少需 {MIN_REF_FRAMES} 帧）。"
+            f"请改选说话声更清楚、音量更高的片段，或请该说话人靠近话筒重录")
 
 
 @app.get("/api/health")
@@ -118,20 +119,25 @@ async def analyze(file: UploadFile = File(...), references: str = Form(...)):
     except RefError as exc:
         _err(400, str(exc))
 
-    features, rms, times = extract_features(y, sr)
-    speech_mask, thr = vad_mask(rms)
+    frames = extract_features(y)
+    profile = estimate_noise(frames)
+    times = frames.times
+    speech_mask = profile.speech_mask
 
     if int(speech_mask.sum()) < MIN_SPEECH_FRAMES:
-        _err(400, "录音中有效语音过少（几乎全为静音），无法分析")
+        _err(400, "录音中有效语音过少（几乎全为静音或只有底噪），无法分析；"
+                  "请确认为 16 kHz 单声道 WAV，且录音里确实有人在说话")
 
     idx_a = refs_to_frame_indices(refs["A"], times, speech_mask)
     idx_b = refs_to_frame_indices(refs["B"], times, speech_mask)
-    for idx, key in ((idx_a, "A"), (idx_b, "B")):
+    for key, idx in (("A", idx_a), ("B", idx_b)):
         if idx.size < MIN_REF_FRAMES:
-            _err(400, f"说话人{SPEAKER_NAMES[key]}的参考段内有效语音不足"
-                      f"（{idx.size} 帧，至少需 {MIN_REF_FRAMES} 帧），请改选包含清晰语音的片段")
+            ref_ev = [float(profile.evidence[i]) for i in idx]
+            ref_max = max(ref_ev) if ref_ev else 0.0
+            _err(400, _ref_advice(key, int(idx.size), ref_max, profile.low_threshold))
 
-    labels, conf = classify_frames(features, idx_a, idx_b)
+    z = cepstral_features(frames.mel, profile.floor)
+    labels, conf = classify_frames(z, idx_a, idx_b, profile)
     labels[~speech_mask] = LABEL_SILENCE
     conf = np.where(speech_mask, conf, 1.0)
 
@@ -145,7 +151,7 @@ async def analyze(file: UploadFile = File(...), references: str = Form(...)):
         "sample_rate": SAMPLE_RATE,
         "frame_count": int(len(labels)),
         "frame_hop_ms": round(1000.0 * FRAME_HOP / SAMPLE_RATE, 1),
-        "vad_threshold": float(thr),
+        "vad_threshold": float(profile.low_threshold),
         "segments": segments,
         "stats": stats,
     }

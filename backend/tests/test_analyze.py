@@ -16,6 +16,7 @@ from scipy.io import wavfile
 from app.audio import SAMPLE_RATE
 from app.demo import DEMO_REFERENCES, SPEECH_PLAN, build_demo, synth_voice, to_wav_bytes
 from app.main import app
+import scenarios as S
 
 client = TestClient(app)
 
@@ -170,6 +171,143 @@ def test_mixed_voices_low_confidence():
     assert resp.status_code == 200, resp.json()
     body = resp.json()
     assert body["stats"]["review"] > 0, "混音区域应出现待复核帧"
+
+
+# ---------- 轻声场景 ----------
+
+def syllable_truth(who: str, duration: float, seed_shift: int, start: float):
+    """基于合成语音自身的音节包络给出“确实在发声”的时间点（相对录音起点）。"""
+    wave = S.voice(who, duration, seed_shift)
+    win, hop = 400, 160
+    n = 1 + (wave.size - win) // hop
+    idx = np.arange(win)[None, :] + hop * np.arange(n)[:, None]
+    rms = np.sqrt(np.mean(wave[idx] ** 2, axis=1))
+    rel = rms / max(float(rms.max()), 1e-9)
+    times = start + (np.arange(n) * hop + win / 2.0) / SAMPLE_RATE
+    return times[rel > 0.30]
+
+
+def label_at(segments, t: float) -> str | None:
+    for seg in segments:
+        if seg["start"] <= t < seg["end"]:
+            return seg["label"]
+    return None
+
+
+def voice_stats(segments, truth: list[tuple[float, str]]) -> dict:
+    counts = {"correct": 0, "silence": 0, "review": 0, "wrong": 0}
+    for t, who in truth:
+        got = label_at(segments, t)
+        if got == who:
+            counts["correct"] += 1
+        elif got == "silence":
+            counts["silence"] += 1
+        elif got == "review":
+            counts["review"] += 1
+        else:
+            counts["wrong"] += 1
+    total = max(1, len(truth))
+    return {k: v / total for k, v in counts.items()}
+
+
+def test_soft_speaker_reference_builds_model():
+    """场景一：轻声说话人的参考本身很轻，但参考仍须参与建模，分析能完成。"""
+    y = S.soft_reference_case()
+    resp = analyze(y, S.SOFT_REFERENCE_REFS)
+    assert resp.status_code == 200, resp.json()
+    segs = resp.json()["segments"]
+
+    truth = []
+    for who, duration, shift, start in [
+        ("A", 1.2, 0, 0.4), ("A", 1.2, 0, 1.7),
+        ("B", 0.8, 0, 3.8), ("B", 0.8, 1, 4.8), ("B", 0.8, 2, 5.8),
+        ("B", 1.0, 4, 7.0), ("B", 0.9, 5, 8.2),
+    ]:
+        truth += [(t, who) for t in syllable_truth(who, duration, shift, start)]
+
+    stats = voice_stats(segs, truth)
+    assert stats["silence"] <= 0.05, f"轻声被误标为静音过多: {stats}"
+    assert stats["wrong"] <= 0.05, f"轻声被误判给他人过多: {stats}"
+    assert stats["correct"] >= 0.80, f"轻声归属正确率不足: {stats}"
+
+
+def test_loud_reference_soft_speech_elsewhere_attributed():
+    """场景二：乙的参考在较响处；参考以外乙的轻声仍应归给乙，而不是静音。"""
+    y = S.loud_reference_soft_elsewhere_case()
+    resp = analyze(y, S.LOUD_REFERENCE_SOFT_REFS)
+    assert resp.status_code == 200, resp.json()
+    segs = resp.json()["segments"]
+
+    truth = []
+    for who, duration, shift, start in [
+        ("A", 1.3, 0, 0.4), ("A", 1.3, 0, 2.0), ("A", 1.0, 0, 10.0),
+        ("B", 0.9, 0, 3.8), ("B", 0.9, 1, 4.9), ("B", 0.9, 2, 6.0),
+        ("B", 1.0, 5, 7.4), ("B", 0.9, 6, 8.7),
+    ]:
+        truth += [(t, who) for t in syllable_truth(who, duration, shift, start)]
+
+    stats = voice_stats(segs, truth)
+    assert stats["silence"] <= 0.05, f"参考以外的轻声被标成静音: {stats}"
+    assert stats["wrong"] <= 0.05, f"轻声被误判给他人: {stats}"
+    assert stats["correct"] >= 0.80, f"参考以外的轻声归属正确率不足: {stats}"
+
+
+def test_pauses_and_noise_are_silence_soft_speaker():
+    """停顿与纯底噪必须标为静音，不能因为轻声判定放宽而被连成语音。"""
+    for y, refs, silence_spans in [
+        (S.soft_reference_case(), S.SOFT_REFERENCE_REFS, S.SOFT_REFERENCE_SILENCE),
+        (S.loud_reference_soft_elsewhere_case(), S.LOUD_REFERENCE_SOFT_REFS,
+         S.LOUD_REFERENCE_SOFT_SILENCE),
+    ]:
+        resp = analyze(y, refs)
+        assert resp.status_code == 200, resp.json()
+        segs = resp.json()["segments"]
+        for t0, t1 in silence_spans:
+            cov = label_coverage(segs, t0, t1)
+            assert cov.get("silence", 0.0) >= 0.90, f"[{t0}, {t1}] 未判为静音: {cov}"
+
+
+def test_noise_only_and_soft_reference_rejected(monkeypatch):
+    """纯底噪录音拒绝分析；参考里只有底噪 / 语音过轻时给出具体原因。"""
+    y = S.soft_reference_case()
+
+    # 乙的参考全落在停顿的纯底噪区
+    silent_refs = {"A": S.SOFT_REFERENCE_REFS["A"],
+                   "B": [[3.3, 3.75], [9.3, 9.7], [6.6, 6.95]]}
+    resp = analyze(y, silent_refs)
+    assert resp.status_code == 400
+    detail = resp.json()["detail"]
+    assert "乙" in detail and "参考语音不足" in detail
+    assert "静音" in detail or "底噪" in detail
+
+    # 乙的参考虽是发言，但音量与底噪几乎不可分
+    too_soft = S.soft_reference_case(noise=0.003, soft_gain=0.0035)
+    resp = analyze(too_soft, {"A": S.SOFT_REFERENCE_REFS["A"],
+                              "B": S.SOFT_REFERENCE_REFS["B"]})
+    assert resp.status_code == 400
+    detail = resp.json()["detail"]
+    assert "乙" in detail and "参考语音不足" in detail
+    assert "太轻" in detail or "底噪" in detail
+
+    # 纯底噪录音没有可用参考
+    noise_only = np.random.default_rng(0).normal(0, 0.004, int(10 * SAMPLE_RATE)).astype(np.float32)
+    resp = analyze(noise_only, S.SOFT_REFERENCE_REFS)
+    assert resp.status_code == 400
+    assert "有效语音过少" in resp.json()["detail"]
+
+
+def test_third_speaker_and_mix_still_review():
+    """放宽轻声判定后，第三人与甲乙混音仍应标为待复核。"""
+    resp = analyze(S.third_speaker_and_mix_case(), S.THIRD_MIX_REFS)
+    assert resp.status_code == 200, resp.json()
+    body = resp.json()
+    cov_third = label_coverage(body["segments"], 6.6, 8.9)
+    cov_mix = label_coverage(body["segments"], 9.6, 11.9)
+    assert cov_third.get("review", 0.0) >= 0.5, f"第三说话人未标待复核: {cov_third}"
+    assert cov_mix.get("review", 0.0) >= 0.5, f"甲乙混音未标待复核: {cov_mix}"
+    for spk, t0, t1 in [("A", 0.6, 2.9), ("B", 3.6, 6.2)]:
+        cov = label_coverage(body["segments"], t0, t1)
+        assert cov.get(spk, 0.0) >= 0.6, f"{spk} 的正常语音归属不足: {cov}"
 
 
 # ---------- 非法输入的拒绝 ----------

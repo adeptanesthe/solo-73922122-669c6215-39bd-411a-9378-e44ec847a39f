@@ -1,9 +1,12 @@
 """短时声学特征提取（仅使用 NumPy / SciPy）。
 
 流程：预加重 -> 分帧(25ms 窗 / 10ms 帧移) -> 加窗 -> 功率谱
--> Mel 滤波器组 -> log -> DCT 得到 MFCC -> 拼接一阶差分与对数能量。
+-> Mel 滤波器组，得到每帧 26 个频带的能量，作为后续
+静音检测（按频带比较底噪）与说话人建模（倒谱特征）的共同输入。
 """
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import numpy as np
 from scipy.fft import dct
@@ -16,6 +19,15 @@ N_MELS = 26
 N_MFCC = 13
 FMIN = 20.0
 FMAX = SAMPLE_RATE / 2.0
+
+
+@dataclass
+class Frames:
+    """整条录音的分帧结果。"""
+
+    mel: np.ndarray      # (n_frames, N_MELS) 各频带能量
+    rms: np.ndarray      # (n_frames,) 短时 RMS，仅用于底噪初筛与展示
+    times: np.ndarray    # (n_frames,) 帧中心时间（秒）
 
 
 def frame_signal(y: np.ndarray, frame_len: int = FRAME_LEN, hop: int = FRAME_HOP) -> np.ndarray:
@@ -56,13 +68,15 @@ def mel_filterbank(sr: int = SAMPLE_RATE, n_fft: int = N_FFT, n_mels: int = N_ME
     return fb
 
 
-def extract_features(y: np.ndarray, sr: int = SAMPLE_RATE):
-    """提取短时特征。
+_FILTERBANK = mel_filterbank()
 
-    返回 (features, rms, times)：
-    - features: (n_frames, 2*N_MFCC + 1)，MFCC + 一阶差分 + 对数能量
-    - rms:      (n_frames,)，每帧短时 RMS（用于静音检测）
-    - times:    (n_frames,)，每帧中心时间（秒）
+
+def extract_features(y: np.ndarray) -> Frames:
+    """提取每帧 Mel 频带能量与 RMS。
+
+    这里刻意不保留对数总能量：本项目的难点是“轻声与底噪响度接近”，
+    总能量会把两者混为一谈；后续静音检测用逐频带信噪比，
+    说话人建模用去掉能量项的倒谱（见 :func:`cepstral_features`）。
     """
     y = np.asarray(y, dtype=np.float64)
     if y.size == 0:
@@ -73,23 +87,39 @@ def extract_features(y: np.ndarray, sr: int = SAMPLE_RATE):
     raw_frames = frame_signal(y)
 
     rms = np.sqrt(np.mean(raw_frames ** 2, axis=1) + 1e-12)
-    log_energy = np.log(np.mean(raw_frames ** 2, axis=1) + 1e-12)
 
     window = np.hamming(frames.shape[1])
     power = np.abs(np.fft.rfft(frames * window, N_FFT, axis=1)) ** 2 / N_FFT
-    mel = power @ mel_filterbank(sr).T
-    mel = np.maximum(mel, 1e-12)
-    mfcc = dct(np.log(mel), type=2, axis=1, norm="ortho")[:, :N_MFCC]
+    mel = np.maximum(power @ _FILTERBANK.T, 1e-12)
 
-    # 一阶差分（边缘用一阶差代替）
-    delta = np.zeros_like(mfcc)
-    n = mfcc.shape[0]
-    if n >= 3:
-        delta[1:-1] = (mfcc[2:] - mfcc[:-2]) / 2.0
-        delta[0] = mfcc[1] - mfcc[0]
-        delta[-1] = mfcc[-1] - mfcc[-2]
-    elif n == 2:
-        delta[0] = delta[1] = (mfcc[1] - mfcc[0]) / 2.0
+    return Frames(mel=mel, rms=rms, times=frame_times(mel.shape[0]))
 
-    features = np.concatenate([mfcc, delta, log_energy[:, None]], axis=1)
-    return features, rms, frame_times(n)
+
+def _smooth_frames(x: np.ndarray, win: int) -> np.ndarray:
+    """沿时间做滑动平均；两端用边缘值延拓，避免首尾帧被削弱。"""
+    if win <= 1 or x.shape[0] == 0:
+        return x
+    win = min(win, x.shape[0])
+    pad = win // 2
+    padded = np.pad(x, ((pad, win - 1 - pad), (0, 0)), mode="edge")
+    kernel = np.ones(win) / win
+    return np.stack([np.convolve(padded[:, j], kernel, mode="valid")
+                     for j in range(x.shape[1])], axis=1)
+
+
+def cepstral_features(mel: np.ndarray, noise_floor: np.ndarray,
+                      alpha: float = 0.7, smooth_frames: int = 3) -> np.ndarray:
+    """由 Mel 能量得到与响度基本无关的倒谱特征。
+
+    1. 逐频带减去底噪（谱减），残差下限取底噪的 5%，避免出现零能量；
+    2. DCT 后丢掉第 0 维（整体响度/增益），只保留 1～12 阶倒谱；
+    3. 每帧减去倒谱均值（消去录音链路带来的整体谱倾斜）；
+    4. 沿时间做 3 帧平滑，压低宽带噪声对单帧特征的扰动。
+
+    第 1、2 步保证轻声与底噪接近时仍有可比较的谱形，
+    第 3 步进一步消除“参考较响、别处较轻”带来的增益差异。
+    """
+    residual = np.maximum(mel - alpha * noise_floor, 0.05 * noise_floor)
+    mfcc = dct(np.log(residual), type=2, axis=1, norm="ortho")[:, 1:N_MFCC]
+    mfcc = mfcc - mfcc.mean(axis=1, keepdims=True)
+    return _smooth_frames(mfcc, smooth_frames)
